@@ -1,0 +1,163 @@
+
+import os
+import gc
+import re
+import ast
+import json
+import math
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+from collections import Counter, defaultdict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import seaborn as sns
+from PIL import Image, ImageDraw
+from tqdm.auto import tqdm
+
+warnings.filterwarnings("ignore")
+SEED = 42
+np.random.seed(SEED)
+
+
+#  PATHS  
+
+DATA_DIR   = Path("/---/working/data")
+TRAIN_DIR  = DATA_DIR / "train"
+TEST_DIR   = DATA_DIR / "test"
+TRAIN_META = TRAIN_DIR / "metadata.jsonl"
+TEST_META  = TEST_DIR  / "metadata.jsonl"
+TRAIN_IMG  = TRAIN_DIR / "images"
+TEST_IMG   = TEST_DIR  / "images"
+SAMPLE_SUB = DATA_DIR  / "sample_submission.csv"
+
+OUTPUT_DIR = Path("/---/working")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+SUB_PATH   = OUTPUT_DIR / "submission.csv"
+
+REGION_TYPES   = ["handwritten", "printed", "formula",
+                  "table", "annotation", "image", "graph"]
+NON_TEXT_TYPES = {"image", "graph"}
+
+print("=" * 70)
+print("HANDWRITTEN-TO-DATA  |  RUKOPYS Pipeline")
+print("=" * 70)
+print(f"  TRAIN_META : {TRAIN_META}  exists={TRAIN_META.exists()}")
+print(f"  TEST_META  : {TEST_META}   exists={TEST_META.exists()}")
+print(f"  TRAIN_IMG  : {TRAIN_IMG}   exists={TRAIN_IMG.exists()}")
+print(f"  TEST_IMG   : {TEST_IMG}    exists={TEST_IMG.exists()}")
+
+
+#  DATA LOADING  — metadata.jsonl → pandas DataFrame
+
+def safe_parse_regions(raw) -> List[Dict]:
+    """
+    Safely parse a regions field that may be a list, JSON string,
+    Python literal string, or NaN/None. Never raises.
+    """
+    if raw is None:
+        return []
+    try:
+        if pd.isna(raw):
+            return []
+    except (TypeError, ValueError):
+        pass
+    if isinstance(raw, list):
+        return raw
+    if raw in ("", "[]"):
+        return []
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    try:
+        return ast.literal_eval(raw)
+    except Exception:
+        return []
+
+
+def load_metadata(meta_path: Path, img_dir: Path, split: str) -> pd.DataFrame:
+    """
+    Load a metadata.jsonl file into a DataFrame.
+
+    Each line in metadata.jsonl is a JSON object. Common fields:
+        file_name   — image filename  (e.g. "images/abc123.jpg")
+        regions     — list of region dicts (train only)
+        + any other metadata fields
+
+    We normalise everything into the columns used by the rest of
+    the pipeline: image, img_path, regions_parsed, n_regions.
+    """
+    records = []
+    with open(meta_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    df = pd.DataFrame(records)
+    print(f"\n[{split.upper()}]  raw shape={df.shape}")
+    print(f"  Columns : {list(df.columns)}")
+    print(df.head(3).to_string(index=False))
+
+    # ── Normalise the image filename column ───────────────────────────────────
+    # HuggingFace metadata.jsonl uses 'file_name' which may include
+    # a leading "images/" prefix — strip it to get a bare filename.
+    if "file_name" in df.columns:
+        df["image"] = df["file_name"].apply(
+            lambda x: Path(str(x)).name   # "images/abc.jpg" → "abc.jpg"
+        )
+    elif "image" not in df.columns:
+        # Fallback: use the first column
+        df["image"] = df.iloc[:, 0].apply(lambda x: Path(str(x)).name)
+
+    # ── Resolve full image path on disk ───────────────────────────────────────
+    def _resolve(fname):
+        p = img_dir / fname
+        return str(p) if p.exists() else None
+
+    df["img_path"] = df["image"].apply(_resolve)
+    found   = df["img_path"].notna().sum()
+    missing = df["img_path"].isna().sum()
+    print(f"  Images found : {found:,}  |  missing : {missing:,}")
+
+    # ── Parse regions (train has them; test does not) ─────────────────────────
+    if "regions" in df.columns:
+        df["regions_parsed"] = df["regions"].apply(safe_parse_regions)
+    else:
+        df["regions_parsed"] = [[] for _ in range(len(df))]
+
+    df["n_regions"] = df["regions_parsed"].apply(len)
+    return df
+
+
+print("\n[INFO] Loading train metadata …")
+train_df = load_metadata(TRAIN_META, TRAIN_IMG, "train")
+
+print("\n[INFO] Loading test metadata …")
+test_df  = load_metadata(TEST_META,  TEST_IMG,  "test")
+
+# ──  sample_submission to confirm expected output format ───────────────
+if SAMPLE_SUB.exists():
+    ss = pd.read_csv(SAMPLE_SUB)
+    print(f"\n  sample_submission.csv  shape={ss.shape}")
+    print(f"  Columns : {list(ss.columns)}")
+    print(ss.head(3).to_string(index=False))
+
+# ── Dataset summary ───────────────────────────────────────────────────────────
+print("\n" + "─" * 70)
+print("  DATASET SUMMARY")
+print("─" * 70)
+print(f"  Train images        : {len(train_df):>6,}")
+print(f"  Test  images        : {len(test_df):>6,}")
+print(f"  Train regions total : {train_df['n_regions'].sum():>6,}")
+print(f"  Avg regions / img   : {train_df['n_regions'].mean():>6.2f}")
+print(f"  Train img found     : {train_df['img_path'].notna().sum():>6,}")
+print(f"  Test  img found     : {test_df['img_path'].notna().sum():>6,}")
+print("\n train_df and test_df are ready.")
