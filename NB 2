@@ -1,0 +1,425 @@
+
+# ── Imports ────
+import os
+import json
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.gridspec import GridSpec
+import seaborn as sns
+from collections import Counter, defaultdict
+from pathlib import Path
+from PIL import Image
+import cv2
+
+# ── Paths ─────────────────────────────────────────────────────
+BASE_DIR     = Path("/---/input/competitions/handwritten-to-data")
+TRAIN_DIR    = BASE_DIR / "train"
+TEST_DIR     = BASE_DIR / "test"
+TRAIN_CSV    = BASE_DIR / "train.csv"
+TEST_CSV     = BASE_DIR / "test.csv"
+SAMPLE_SUB   = BASE_DIR / "sample_submission.csv"
+
+print("=== Directory listing ===")
+for p in [BASE_DIR, TRAIN_DIR, TEST_DIR]:
+    if p.exists():
+        files = list(p.iterdir())
+        print(f"{p}: {len(files)} items")
+        for f in files[:10]:
+            print(f"   {f.name}")
+    else:
+        print(f"{p}: NOT FOUND")
+
+# ── Load Annotations ─────────────────────────────────────────
+def load_csv_safe(path):
+    """Load CSV safely with multiple separator detection."""
+    try:
+        df = pd.read_csv(path)
+        print(f"Loaded {path.name}: {df.shape}")
+        print(df.head(3))
+        return df
+    except Exception as e:
+        print(f"Could not load {path}: {e}")
+        return pd.DataFrame()
+
+train_df = load_csv_safe(TRAIN_CSV)
+test_df  = load_csv_safe(TEST_CSV)
+sample_df = load_csv_safe(SAMPLE_SUB)
+
+# ── Parse regions JSON column ─────────────────────────────────
+def parse_regions(regions_str):
+    """Safely parse JSON regions string."""
+    if pd.isna(regions_str) or regions_str == "[]" or regions_str == "":
+        return []
+    try:
+        if isinstance(regions_str, list):
+            return regions_str
+        return json.loads(regions_str)
+    except Exception:
+        return []
+
+if "regions" in train_df.columns:
+    train_df["regions_parsed"] = train_df["regions"].apply(parse_regions)
+else:
+    # Try to find annotation column
+    print("Columns in train_df:", train_df.columns.tolist())
+    train_df["regions_parsed"] = [[] for _ in range(len(train_df))]
+
+# ── Flatten regions for EDA ───────────────────────────────────
+region_rows = []
+for _, row in train_df.iterrows():
+    img_name = row.get("image", row.iloc[0])
+    for reg in row["regions_parsed"]:
+        if isinstance(reg, dict):
+            region_rows.append({
+                "image":   img_name,
+                "type":    reg.get("type", "unknown"),
+                "text":    reg.get("text", ""),
+                "bbox":    reg.get("bbox", []),
+                "text_len": len(str(reg.get("text", ""))),
+            })
+
+regions_df = pd.DataFrame(region_rows)
+print(f"\nTotal annotated regions: {len(regions_df)}")
+if len(regions_df) > 0:
+    print(regions_df["type"].value_counts())
+
+# ── FIGURE 1: Dataset Overview ────────────────────────────────
+fig = plt.figure(figsize=(20, 14))
+fig.suptitle("RUKOPYS — Dataset Overview", fontsize=20, fontweight="bold", y=0.98)
+gs = GridSpec(3, 4, figure=fig, hspace=0.45, wspace=0.4)
+
+# 1a) Train / Test split
+ax1 = fig.add_subplot(gs[0, 0])
+counts = [len(train_df), len(test_df)]
+bars = ax1.bar(["Train", "Test"], counts, color=["#2196F3", "#FF9800"], edgecolor="black", width=0.5)
+for b, c in zip(bars, counts):
+    ax1.text(b.get_x() + b.get_width()/2, b.get_height() + max(counts)*0.01,
+             str(c), ha="center", va="bottom", fontsize=12, fontweight="bold")
+ax1.set_title("Train / Test Split", fontweight="bold")
+ax1.set_ylabel("Image Count")
+ax1.set_ylim(0, max(counts) * 1.2)
+
+# 1b) Region type distribution
+ax2 = fig.add_subplot(gs[0, 1:3])
+if len(regions_df) > 0 and "type" in regions_df.columns:
+    type_counts = regions_df["type"].value_counts()
+    colors = plt.cm.Set3(np.linspace(0, 1, len(type_counts)))
+    bars2 = ax2.barh(type_counts.index, type_counts.values, color=colors, edgecolor="black")
+    for b, v in zip(bars2, type_counts.values):
+        ax2.text(v + max(type_counts.values)*0.01, b.get_y() + b.get_height()/2,
+                 str(v), va="center", fontsize=10)
+    ax2.set_title("Region Types Distribution", fontweight="bold")
+    ax2.set_xlabel("Count")
+else:
+    ax2.text(0.5, 0.5, "No region type data", ha="center", va="center", transform=ax2.transAxes)
+    ax2.set_title("Region Types Distribution", fontweight="bold")
+
+# 1c) Regions per image histogram
+ax3 = fig.add_subplot(gs[0, 3])
+if len(regions_df) > 0:
+    regs_per_image = regions_df.groupby("image").size()
+    ax3.hist(regs_per_image, bins=min(30, len(regs_per_image)), color="#4CAF50", edgecolor="black", alpha=0.85)
+    ax3.axvline(regs_per_image.mean(), color="red", linestyle="--", linewidth=2,
+                label=f"Mean={regs_per_image.mean():.1f}")
+    ax3.set_title("Regions per Image", fontweight="bold")
+    ax3.set_xlabel("# Regions")
+    ax3.set_ylabel("Frequency")
+    ax3.legend(fontsize=9)
+else:
+    ax3.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax3.transAxes)
+
+# 1d) Text length distribution
+ax4 = fig.add_subplot(gs[1, :2])
+if len(regions_df) > 0 and "text_len" in regions_df.columns:
+    scorable = regions_df[regions_df["text_len"] > 0]
+    if len(scorable) > 0:
+        ax4.hist(scorable["text_len"].clip(upper=500), bins=50,
+                 color="#9C27B0", edgecolor="black", alpha=0.8)
+        ax4.axvline(scorable["text_len"].mean(), color="orange", linestyle="--",
+                    linewidth=2, label=f"Mean={scorable['text_len'].mean():.1f}")
+        ax4.set_title("Text Length Distribution (chars, clipped @500)", fontweight="bold")
+        ax4.set_xlabel("Characters")
+        ax4.set_ylabel("Frequency")
+        ax4.legend()
+else:
+    ax4.text(0.5, 0.5, "No text length data", ha="center", va="center", transform=ax4.transAxes)
+
+# 1e) Text length by region type (boxplot)
+ax5 = fig.add_subplot(gs[1, 2:])
+if len(regions_df) > 0 and "type" in regions_df.columns and "text_len" in regions_df.columns:
+    text_data = regions_df[regions_df["text_len"] > 0]
+    if len(text_data) > 0:
+        types_order = text_data.groupby("type")["text_len"].median().sort_values().index.tolist()
+        data_by_type = [text_data[text_data["type"] == t]["text_len"].clip(upper=500).values
+                        for t in types_order]
+        bp = ax5.boxplot(data_by_type, labels=types_order, patch_artist=True,
+                         medianprops=dict(color="red", linewidth=2))
+        colors5 = plt.cm.Pastel1(np.linspace(0, 1, len(types_order)))
+        for patch, color in zip(bp["boxes"], colors5):
+            patch.set_facecolor(color)
+        ax5.set_title("Text Length by Region Type", fontweight="bold")
+        ax5.set_xlabel("Region Type")
+        ax5.set_ylabel("Text Length (chars)")
+        ax5.tick_params(axis="x", rotation=30)
+else:
+    ax5.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax5.transAxes)
+
+# 1f) Metric weights pie
+ax6 = fig.add_subplot(gs[2, 0])
+metric_labels = ["Page CER\n(50%)", "Region CER\n(30%)", "Detection F1\n(15%)", "Class Acc\n(5%)"]
+metric_sizes  = [50, 30, 15, 5]
+metric_colors = ["#F44336", "#2196F3", "#4CAF50", "#FF9800"]
+wedges, texts, autotexts = ax6.pie(metric_sizes, labels=metric_labels, colors=metric_colors,
+                                    autopct="%1.0f%%", startangle=90,
+                                    textprops={"fontsize": 8}, pctdistance=0.7)
+for at in autotexts:
+    at.set_fontweight("bold")
+ax6.set_title("Metric Weights", fontweight="bold")
+
+# 1g) Images with zero / non-zero regions
+ax7 = fig.add_subplot(gs[2, 1])
+if len(train_df) > 0 and "regions_parsed" in train_df.columns:
+    has_regions = train_df["regions_parsed"].apply(lambda x: len(x) > 0)
+    ax7.bar(["Has Regions", "No Regions"],
+            [has_regions.sum(), (~has_regions).sum()],
+            color=["#2196F3", "#9E9E9E"], edgecolor="black")
+    ax7.set_title("Images w/ Annotations", fontweight="bold")
+    ax7.set_ylabel("Count")
+else:
+    ax7.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax7.transAxes)
+
+# 1h) Top 20 most frequent characters in text
+ax8 = fig.add_subplot(gs[2, 2:])
+if len(regions_df) > 0 and "text" in regions_df.columns:
+    all_text = " ".join(regions_df["text"].dropna().astype(str).tolist())
+    all_text_clean = all_text.replace(" ", "").replace("\n", "")
+    char_counts = Counter(all_text_clean)
+    top_chars = char_counts.most_common(25)
+    if top_chars:
+        chars, cnts = zip(*top_chars)
+        ax8.bar(range(len(chars)), cnts, color="#607D8B", edgecolor="black")
+        ax8.set_xticks(range(len(chars)))
+        ax8.set_xticklabels([c if c.strip() else "SPC" for c in chars], fontsize=10)
+        ax8.set_title("Top 25 Most Frequent Characters", fontweight="bold")
+        ax8.set_ylabel("Count")
+else:
+    ax8.text(0.5, 0.5, "No character data", ha="center", va="center", transform=ax8.transAxes)
+
+plt.savefig("eda_figure1_dataset_overview.png", dpi=130, bbox_inches="tight")
+plt.show()
+print("Figure 1 saved.")
+
+# ── FIGURE 2: Image-level Visual Analysis ───
+def get_image_stats(img_dir, sample_n=200):
+    """Collect image statistics: size, aspect ratio, brightness."""
+    stats = []
+    img_files = list(img_dir.glob("*.*")) if img_dir.exists() else []
+    sample_files = random.sample(img_files, min(sample_n, len(img_files)))
+    for f in sample_files:
+        try:
+            img = Image.open(f).convert("RGB")
+            w, h = img.size
+            arr = np.array(img)
+            stats.append({
+                "file":   f.name,
+                "width":  w,
+                "height": h,
+                "aspect": w / h,
+                "brightness": arr.mean(),
+                "std":    arr.std(),
+                "r_mean": arr[:, :, 0].mean(),
+                "g_mean": arr[:, :, 1].mean(),
+                "b_mean": arr[:, :, 2].mean(),
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(stats)
+
+print("Collecting image statistics (this may take a moment) ...")
+train_img_stats = get_image_stats(TRAIN_DIR, sample_n=200)
+test_img_stats  = get_image_stats(TEST_DIR, sample_n=100)
+print(f"Train img stats: {len(train_img_stats)}, Test img stats: {len(test_img_stats)}")
+
+fig2, axes2 = plt.subplots(2, 4, figsize=(22, 10))
+fig2.suptitle("RUKOPYS — Image Statistics", fontsize=18, fontweight="bold")
+
+def safe_plot_hist(ax, data, title, xlabel, color, bins=40):
+    if len(data) > 0:
+        ax.hist(data, bins=bins, color=color, edgecolor="black", alpha=0.8)
+        ax.axvline(data.mean(), color="red", linestyle="--", linewidth=2,
+                   label=f"μ={data.mean():.1f}")
+        ax.set_title(title, fontweight="bold")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Count")
+        ax.legend(fontsize=9)
+    else:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+
+if len(train_img_stats) > 0:
+    safe_plot_hist(axes2[0, 0], train_img_stats["width"],  "Image Width  (Train)",  "Pixels", "#2196F3")
+    safe_plot_hist(axes2[0, 1], train_img_stats["height"], "Image Height (Train)",  "Pixels", "#4CAF50")
+    safe_plot_hist(axes2[0, 2], train_img_stats["aspect"], "Aspect Ratio (Train)",  "W/H",    "#FF9800")
+    safe_plot_hist(axes2[0, 3], train_img_stats["brightness"], "Brightness (Train)", "Mean pixel", "#9C27B0")
+else:
+    for ax in axes2[0]:
+        ax.text(0.5, 0.5, "No train images found", ha="center", va="center", transform=ax.transAxes)
+
+if len(test_img_stats) > 0:
+    safe_plot_hist(axes2[1, 0], test_img_stats["width"],  "Image Width  (Test)",   "Pixels", "#1976D2")
+    safe_plot_hist(axes2[1, 1], test_img_stats["height"], "Image Height (Test)",   "Pixels", "#388E3C")
+    safe_plot_hist(axes2[1, 2], test_img_stats["aspect"], "Aspect Ratio (Test)",   "W/H",    "#F57C00")
+    safe_plot_hist(axes2[1, 3], test_img_stats["brightness"], "Brightness (Test)", "Mean pixel", "#7B1FA2")
+else:
+    for ax in axes2[1]:
+        ax.text(0.5, 0.5, "No test images found", ha="center", va="center", transform=ax.transAxes)
+
+plt.tight_layout()
+plt.savefig("eda_figure2_image_stats.png", dpi=130, bbox_inches="tight")
+plt.show()
+print("Figure 2 saved.")
+
+# ── FIGURE 3: Sample Annotated Images ────────────────────────
+def show_annotated_samples(train_df, train_dir, n=6):
+    """Display sample images with bounding box overlays."""
+    annotated = train_df[train_df["regions_parsed"].apply(lambda x: len(x) > 0)]
+    samples = annotated.sample(min(n, len(annotated)), random_state=42) if len(annotated) >= 1 else annotated
+
+    TYPE_COLORS = {
+        "handwritten": "#FF0000", "printed": "#0000FF", "formula": "#00AA00",
+        "table": "#FF8C00",       "annotation": "#AA00FF", "image": "#00AAAA",
+        "graph": "#FF00FF",       "unknown": "#888888",
+    }
+
+    fig3, axes3 = plt.subplots(2, 3, figsize=(21, 14))
+    fig3.suptitle("Sample Annotated Images with Bounding Boxes", fontsize=16, fontweight="bold")
+    axes3 = axes3.flatten()
+
+    for ax in axes3:
+        ax.axis("off")
+
+    for idx, (_, row) in enumerate(samples.iterrows()):
+        if idx >= len(axes3):
+            break
+        img_name = row.get("image", row.iloc[0])
+        img_path = train_dir / img_name
+        if not img_path.exists():
+            axes3[idx].text(0.5, 0.5, f"Image not found:\n{img_name}",
+                            ha="center", va="center", transform=axes3[idx].transAxes, fontsize=9)
+            continue
+        try:
+            img = Image.open(img_path).convert("RGB")
+            img_arr = np.array(img)
+            axes3[idx].imshow(img_arr)
+            axes3[idx].set_title(img_name[:40], fontsize=8, fontweight="bold")
+            for reg in row["regions_parsed"]:
+                if not isinstance(reg, dict):
+                    continue
+                bbox = reg.get("bbox", [])
+                rtype = reg.get("type", "unknown")
+                text  = str(reg.get("text", ""))[:30]
+                color = TYPE_COLORS.get(rtype, "#888888")
+                if len(bbox) == 4:
+                    x1, y1, x2, y2 = bbox
+                    rect = patches.Rectangle((x1, y1), x2-x1, y2-y1,
+                                             linewidth=2, edgecolor=color,
+                                             facecolor="none", alpha=0.85)
+                    axes3[idx].add_patch(rect)
+                    axes3[idx].text(x1, max(y1-5, 0), rtype[:3],
+                                    color=color, fontsize=6, fontweight="bold",
+                                    bbox=dict(boxstyle="round,pad=0.1", facecolor="white", alpha=0.6))
+        except Exception as e:
+            axes3[idx].text(0.5, 0.5, f"Error: {str(e)[:50]}",
+                            ha="center", va="center", transform=axes3[idx].transAxes, fontsize=8)
+
+    # Legend
+    legend_elements = [patches.Patch(facecolor="none", edgecolor=c, linewidth=2, label=t)
+                       for t, c in TYPE_COLORS.items()]
+    fig3.legend(handles=legend_elements, loc="lower center", ncol=4, fontsize=10,
+                title="Region Types", title_fontsize=11,
+                bbox_to_anchor=(0.5, 0.0))
+
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
+    plt.savefig("eda_figure3_annotated_samples.png", dpi=130, bbox_inches="tight")
+    plt.show()
+    print("Figure 3 saved.")
+
+show_annotated_samples(train_df, TRAIN_DIR, n=6)
+
+# ── FIGURE 4: Bounding Box Analysis ──────────────────────────
+if len(regions_df) > 0 and len(regions_df["bbox"].dropna()) > 0:
+    bbox_data = regions_df[regions_df["bbox"].apply(lambda x: isinstance(x, list) and len(x) == 4)]
+    bbox_data = bbox_data.copy()
+    bbox_data["x1"]     = bbox_data["bbox"].apply(lambda b: b[0])
+    bbox_data["y1"]     = bbox_data["bbox"].apply(lambda b: b[1])
+    bbox_data["x2"]     = bbox_data["bbox"].apply(lambda b: b[2])
+    bbox_data["y2"]     = bbox_data["bbox"].apply(lambda b: b[3])
+    bbox_data["bw"]     = bbox_data["x2"] - bbox_data["x1"]
+    bbox_data["bh"]     = bbox_data["y2"] - bbox_data["y1"]
+    bbox_data["area"]   = bbox_data["bw"] * bbox_data["bh"]
+    bbox_data["aspect"] = bbox_data["bw"] / (bbox_data["bh"] + 1e-6)
+
+    fig4, axes4 = plt.subplots(2, 3, figsize=(20, 12))
+    fig4.suptitle("Bounding Box Analysis", fontsize=16, fontweight="bold")
+
+    safe_plot_hist(axes4[0, 0], bbox_data["bw"].clip(upper=2000),  "BBox Width",   "px", "#E91E63")
+    safe_plot_hist(axes4[0, 1], bbox_data["bh"].clip(upper=1000),  "BBox Height",  "px", "#3F51B5")
+    safe_plot_hist(axes4[0, 2], bbox_data["aspect"].clip(0, 30),   "BBox Aspect",  "W/H","#009688")
+
+    # Area by type
+    ax41 = axes4[1, 0]
+    if "type" in bbox_data.columns:
+        type_area = bbox_data.groupby("type")["area"].median().sort_values()
+        ax41.barh(type_area.index, type_area.values,
+                  color=plt.cm.Set2(np.linspace(0, 1, len(type_area))), edgecolor="black")
+        ax41.set_title("Median BBox Area by Type", fontweight="bold")
+        ax41.set_xlabel("Pixels²")
+
+    # BBox scatter (x1, y1 origin positions)
+    ax42 = axes4[1, 1]
+    ax42.scatter(bbox_data["x1"].clip(upper=3000).values,
+                 bbox_data["y1"].clip(upper=4000).values,
+                 c="#FF5722", alpha=0.15, s=5)
+    ax42.set_title("BBox Top-Left Origins", fontweight="bold")
+    ax42.set_xlabel("x1 (px)")
+    ax42.set_ylabel("y1 (px)")
+    ax42.invert_yaxis()
+
+    # Width vs Height scatter
+    ax43 = axes4[1, 2]
+    types_uniq = bbox_data["type"].unique() if "type" in bbox_data.columns else ["unknown"]
+    cmap43 = plt.cm.tab10(np.linspace(0, 1, len(types_uniq)))
+    for i, t in enumerate(types_uniq):
+        sub = bbox_data[bbox_data["type"] == t] if "type" in bbox_data.columns else bbox_data
+        ax43.scatter(sub["bw"].clip(upper=2000).values,
+                     sub["bh"].clip(upper=1000).values,
+                     c=[cmap43[i]], alpha=0.25, s=6, label=t)
+    ax43.set_title("BBox Width vs Height", fontweight="bold")
+    ax43.set_xlabel("Width (px)")
+    ax43.set_ylabel("Height (px)")
+    ax43.legend(fontsize=7, markerscale=3)
+
+    plt.tight_layout()
+    plt.savefig("eda_figure4_bbox_analysis.png", dpi=130, bbox_inches="tight")
+    plt.show()
+    print("Figure 4 saved.")
+else:
+    print("Skipping Figure 4: no bbox data available.")
+
+# ── Summary Stats ─────────────────────────────────────────────
+print("\n" + "="*60)
+print("DATASET SUMMARY")
+print("="*60)
+print(f"Train images      : {len(train_df)}")
+print(f"Test  images      : {len(test_df)}")
+print(f"Total regions     : {len(regions_df)}")
+if len(regions_df) > 0:
+    print(f"Unique region types: {regions_df['type'].nunique() if 'type' in regions_df.columns else 'N/A'}")
+    avg_r = len(regions_df) / max(len(train_df), 1)
+    print(f"Avg regions/image  : {avg_r:.2f}")
+if len(train_img_stats) > 0:
+    print(f"Avg image width  : {train_img_stats['width'].mean():.0f} px")
+    print(f"Avg image height : {train_img_stats['height'].mean():.0f} px")
+print("="*60)
